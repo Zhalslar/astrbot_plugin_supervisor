@@ -1,129 +1,210 @@
 import os
 import random
+import time
+
 from astrbot.api import logger
 from astrbot.api.event import filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 from astrbot.core import AstrBotConfig
-import astrbot.core.message.components as Comp
+from astrbot.core.message.components import At, Image, Plain
 from astrbot.core.platform import AstrMessageEvent
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+    AiocqhttpMessageEvent,
+)
 from astrbot.core.star.filter.event_message_type import EventMessageType
 
+from .utils import get_ats, get_nickname
 
-@register(
-    "astrbot_plugin_supervisor",
-    "Zhalslar",
-    "赛博监工，检测到某人水群，就提醒他滚去干活",
-    "1.0.1",
-    "https://github.com/Zhalslar/astrbot_plugin_supervisor",
-)
+
 class SupervisorPlugin(Star):
+    """
+    监督插件（生产级）
+
+    设计要点：
+    - 无定时器
+    - 监督状态 = qq -> 过期时间戳
+    - 消息入口裁决 + 顺手回收过期数据
+    """
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+
         self.image_dir = os.path.join(
             "data", "plugins", "astrbot_plugin_supervisor", "image"
         )
-        os.makedirs(self.image_dir, exist_ok=True)
-        self.supervisor_prompt = config.get(
-            "supervisor_prompt", "督促这黑奴别水群滚去干活"
-        )
-        logger.info(f"监工插件已加载白名单QQ号: {self.config['whitelist_qq']}")
 
-    @filter.command("监督")
-    async def add_supervisor(
-        self, event: AstrMessageEvent, input_id: str | None = None
-    ):
-        """监督某人"""
-        target_id = self.get_target_id(event, input_id)
-        self.config["whitelist_qq"].append(target_id)
-        self.config.save_config(replace_config=self.config)
-        yield event.plain_result(f"已监督: {target_id}")
-        logger.info(f"监工插件当前白名单QQ号: {self.config['whitelist_qq']}")
+        # qq -> expire_ts
+        self.supervisors: dict[str, int] = {}
 
-    @filter.command("解除监督")
-    async def remove_supervisor(
-        self, event: AstrMessageEvent, input_id: str | None = None
-    ):
-        """解除监督某人"""
-        target_id = self.get_target_id(event, input_id)
-        self.config["whitelist_qq"].remove(target_id)
-        self.config.save_config(replace_config=self.config)
-        yield event.plain_result(f"已解除监督: {target_id}")
-        logger.info(f"监工插件当前白名单QQ号: {self.config['whitelist_qq']}")
+        # 兜底配置
+        self.default_minute: int = int(self.config.get("default_minute", 10))
 
-    def get_target_id(self, event: AstrMessageEvent, input_id: str | None = None):
-        """获取目标id"""
-        return input_id or next(
-            (
-                str(seg.qq)
-                for seg in event.get_messages()
-                if (isinstance(seg, Comp.At)) and str(seg.qq) != event.get_self_id()
-            )
-        )
+    # ------------------------------------------------------------------
+    # 工具方法
+    # ------------------------------------------------------------------
 
-    @filter.event_message_type(EventMessageType.ALL)
-    async def on_supervisor(self, event: AstrMessageEvent):
-        sender_id = event.get_sender_id()
+    def _now(self) -> int:
+        return int(time.time())
 
-        if sender_id not in self.config["whitelist_qq"]:
+    def _cleanup_expired(self) -> None:
+        """清理过期监督（轻量、无副作用）"""
+        now = self._now()
+        expired = [qq for qq, ts in self.supervisors.items() if ts <= now]
+
+        if not expired:
             return
-        event_random = random.random()  # 触发概率
-        chain = []
-        if event_random < 0.4:
-            if image_path := self.get_random_image(self.image_dir):
-                chain = [Comp.At(qq=sender_id), Comp.Image(image_path)]
 
-        elif event_random < 0.8:
-            message_str = event.get_message_str()
-            if ai_plain := await self.ai_supervisor(message_str):
-                chain = [Comp.Plain(ai_plain)]
+        for qq in expired:
+            self.supervisors.pop(qq, None)
 
-        else:
-            await self.poke_supervisor(event)
+        logger.debug(f"已清理过期监督: {expired}")
 
-        yield event.chain_result(chain)  # type: ignore
+    def _is_supervising(self, qq: str) -> bool:
+        """是否在监督期内"""
+        expire = self.supervisors.get(qq)
+        return bool(expire and expire > self._now())
 
     @staticmethod
-    def get_random_image(image_dir: str):
-        """随机选图"""
-        entries = os.listdir(image_dir)
-        if not entries:
-            logger.warning("监工失败: 没有可选用的图片")
+    def _get_random_image(image_dir: str) -> str | None:
+        try:
+            entries = os.listdir(image_dir)
+        except FileNotFoundError:
+            logger.warning("监督图片目录不存在")
             return None
-        random_entry = random.choice(entries)
-        return os.path.join(image_dir, random_entry)
 
-    async def ai_supervisor(self):
-        """让LLM监工"""
+        if not entries:
+            logger.warning("监督图片目录为空")
+            return None
 
-        func_tools_mgr = self.context.get_llm_tool_manager()
+        return os.path.join(image_dir, random.choice(entries))
 
-        system_prompt = self.supervisor_prompt
-
+    async def _ai_supervisor(self, text: str) -> str | None:
         try:
             llm_response = await self.context.get_using_provider().text_chat(
-                prompt="他来水群了",
-                contexts=[{"role": "system", "content": system_prompt}],
-                image_urls=[],
-                func_tool=func_tools_mgr,
+                prompt=f"他来水群了：{text}",
+                contexts=[
+                    {
+                        "role": "system",
+                        "content": self.config.get(
+                            "supervisor_prompt", "你是一个严格但幽默的群监工"
+                        ),
+                    }
+                ],
             )
-
             return " " + llm_response.completion_text
         except Exception as e:
             logger.error(f"LLM 监工失败: {e}")
+            return None
 
-    async def poke_supervisor(self, event: AstrMessageEvent):
-        """戳一戳监工"""
-        if event.get_platform_name() == "aiocqhttp":
-            from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
-                AiocqhttpMessageEvent,
+    async def _poke_supervisor(self, event: AiocqhttpMessageEvent) -> None:
+        try:
+            await event.bot.send_poke(
+                user_id=int(event.get_sender_id()),
+                group_id=int(event.get_group_id()),
             )
+        except Exception as e:
+            logger.error(f"戳一戳监工失败: {e}")
 
-            assert isinstance(event, AiocqhttpMessageEvent)
-            client = event.bot
-            user_id = event.get_sender_id()
-            group_id = event.get_group_id()
-            try:
-                await client.send_poke(user_id=int(user_id), group_id=int(group_id))
-            except Exception as e:
-                logger.error(f"戳一戳监工失败: {e}")
+    # ------------------------------------------------------------------
+    # 消息入口
+    # ------------------------------------------------------------------
+
+    @filter.event_message_type(EventMessageType.GROUP_MESSAGE)
+    async def on_supervisor(self, event: AstrMessageEvent):
+        """消息入口"""
+        sender_id = event.get_sender_id()
+
+        # 顺手清理（成本极低）
+        self._cleanup_expired()
+
+        if not self._is_supervising(sender_id):
+            return
+
+        rand = random.random()
+        chain = []
+
+        if rand < 0.4:
+            if image := self._get_random_image(self.image_dir):
+                chain = [At(qq=sender_id), Image(image)]
+
+        elif rand < 0.8:
+            if text := await self._ai_supervisor(event.get_message_str()):
+                chain = [Plain(text)]
+
+        elif isinstance(event, AiocqhttpMessageEvent):
+            await self._poke_supervisor(event)
+
+        if chain:
+            yield event.chain_result(chain)  # type: ignore
+
+    # ------------------------------------------------------------------
+    # 指令：监督
+    # ------------------------------------------------------------------
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("监督")
+    async def add_supervisor(self, event: AstrMessageEvent):
+        parts = event.message_str.split()
+        raw_minute = (
+            int(parts[-1]) if parts and parts[-1].isdigit() else self.default_minute
+        )
+        # 强制范围限制
+        minute = min(
+            self.config["max_minute"],
+            max(1, raw_minute),
+        )
+
+        at_ids = get_ats(event, noself=True)
+        if not at_ids:
+            yield event.plain_result("请 @ 要监督的对象")
+            return
+
+        expire = self._now() + minute * 60
+        nicknames = []
+        for qq in at_ids:
+            self.supervisors[qq] = expire
+            nickname = await get_nickname(event, qq)
+            nicknames.append(nickname)
+
+        yield event.plain_result(f"已监督：{'、'.join(nicknames)}({minute}分钟)")
+
+    # ------------------------------------------------------------------
+    # 指令：解除监督
+    # ------------------------------------------------------------------
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("解除监督")
+    async def remove_supervisor(self, event: AstrMessageEvent):
+        at_ids = get_ats(event, noself=True)
+        if not at_ids:
+            yield event.plain_result("请 @ 要解除监督的对象")
+            return
+
+        nicknames = []
+        for qq in at_ids:
+            self.supervisors.pop(qq, None)
+            nickname = await get_nickname(event, qq)
+            nicknames.append(nickname)
+
+        yield event.plain_result(f"已解除监督：{'、'.join(nicknames)}")
+
+    # ------------------------------------------------------------------
+    # 指令：查看监督
+    # ------------------------------------------------------------------
+
+    @filter.command("监督列表")
+    async def list_supervisors(self, event: AstrMessageEvent):
+        self._cleanup_expired()
+
+        if not self.supervisors:
+            yield event.plain_result("当前没有正在监督的对象")
+            return
+
+        now = self._now()
+        lines = []
+
+        for qq, ts in self.supervisors.items():
+            remain = max(0, (ts - now) // 60)
+            nickname = await get_nickname(event, qq)
+            lines.append(f"{nickname}（剩余{remain}分钟）")
+
+        yield event.plain_result("监督中：\n" + "\n".join(lines))
