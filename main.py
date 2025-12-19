@@ -13,7 +13,7 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
 )
 from astrbot.core.star.filter.event_message_type import EventMessageType
 
-from .utils import get_ats
+from .utils import get_ats, get_nickname
 
 
 class SupervisorPlugin(Star):
@@ -141,7 +141,7 @@ class SupervisorPlugin(Star):
     # ------------------------------------------------------------------
     # 指令：监督
     # ------------------------------------------------------------------
-
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("监督")
     async def add_supervisor(self, event: AstrMessageEvent):
         parts = event.message_str.split()
@@ -160,15 +160,18 @@ class SupervisorPlugin(Star):
             return
 
         expire = self._now() + minute * 60
+        nicknames = []
         for qq in at_ids:
             self.supervisors[qq] = expire
+            nickname = await get_nickname(event, qq)
+            nicknames.append(nickname)
 
-        yield event.plain_result(f"已监督 {at_ids}，时长 {minute} 分钟")
+        yield event.plain_result(f"已监督：{'、'.join(nicknames)}({minute}分钟)")
 
     # ------------------------------------------------------------------
     # 指令：解除监督
     # ------------------------------------------------------------------
-
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("解除监督")
     async def remove_supervisor(self, event: AstrMessageEvent):
         at_ids = get_ats(event, noself=True)
@@ -176,10 +179,13 @@ class SupervisorPlugin(Star):
             yield event.plain_result("请 @ 要解除监督的对象")
             return
 
+        nicknames = []
         for qq in at_ids:
             self.supervisors.pop(qq, None)
+            nickname = await get_nickname(event, qq)
+            nicknames.append(nickname)
 
-        yield event.plain_result(f"已解除监督: {at_ids}")
+        yield event.plain_result(f"已解除监督：{'、'.join(nicknames)}")
 
     # ------------------------------------------------------------------
     # 指令：查看监督
@@ -195,8 +201,10 @@ class SupervisorPlugin(Star):
 
         now = self._now()
         lines = []
+
         for qq, ts in self.supervisors.items():
             remain = max(0, (ts - now) // 60)
-            lines.append(f"{qq}（剩余 {remain} 分钟）")
+            nickname = await get_nickname(event, qq)
+            lines.append(f"{nickname}（剩余{remain}分钟）")
 
         yield event.plain_result("监督中：\n" + "\n".join(lines))
