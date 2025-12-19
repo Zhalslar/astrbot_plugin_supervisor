@@ -58,8 +58,6 @@ class SupervisorPlugin(Star):
         for qq in expired:
             self.supervisors.pop(qq, None)
 
-        self.config["supervisors"] = self.supervisors
-        self.config.save_config()
         logger.debug(f"已清理过期监督: {expired}")
 
     def _is_supervising(self, qq: str) -> bool:
@@ -147,8 +145,13 @@ class SupervisorPlugin(Star):
     @filter.command("监督")
     async def add_supervisor(self, event: AstrMessageEvent):
         parts = event.message_str.split()
-        minute = (
+        raw_minute = (
             int(parts[-1]) if parts and parts[-1].isdigit() else self.default_minute
+        )
+        # 强制范围限制
+        minute = min(
+            self.config["max_minute"],
+            max(1, raw_minute),
         )
 
         at_ids = get_ats(event, noself=True)
@@ -159,9 +162,6 @@ class SupervisorPlugin(Star):
         expire = self._now() + minute * 60
         for qq in at_ids:
             self.supervisors[qq] = expire
-
-        self.config["supervisors"] = self.supervisors
-        self.config.save_config()
 
         yield event.plain_result(f"已监督 {at_ids}，时长 {minute} 分钟")
 
@@ -178,9 +178,6 @@ class SupervisorPlugin(Star):
 
         for qq in at_ids:
             self.supervisors.pop(qq, None)
-
-        self.config["supervisors"] = self.supervisors
-        self.config.save_config()
 
         yield event.plain_result(f"已解除监督: {at_ids}")
 

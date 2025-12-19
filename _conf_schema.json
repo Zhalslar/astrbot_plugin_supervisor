@@ -10,6 +10,12 @@
         },
         "default": 60
     },
+    "max_minute": {
+        "description": "最大监督时长",
+        "hint": "单位：分钟",
+        "type": "int",
+        "default": 10080
+    },
     "supervisor_prompt": {
         "description": "AI监工人设",
         "hint": "",
